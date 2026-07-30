@@ -1,8 +1,39 @@
 const TIMEOUT_ERROR = "SELECTTREE-TIMEOUT";
 
+/*
+customElements.whenDefined() for a name that never gets registered stays pending
+for the lifetime of the page. Awaiting it directly means the async scope -- which
+holds `el` -- is captured by that promise's reaction list and can never be
+collected. That happens with a mistyped card type, or a card that was removed
+while dashboards still reference it.
+
+Waiting with a deadline keeps the behaviour for elements that simply load late,
+while making sure we let go of the element if the definition never arrives. The
+waiter closure below captures only its own resolve function and timer.
+*/
+const DEFINITION_TIMEOUT = 5000;
+
+export async function whenDefinedOrTimeout(
+  name: string,
+  timeout = DEFINITION_TIMEOUT
+): Promise<void> {
+  if (customElements.get(name)) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      resolve();
+    };
+    const timer = window.setTimeout(finish, timeout);
+    customElements.whenDefined(name).then(finish);
+  });
+}
+
 export async function await_element(el, hard = false) {
   if (el.localName?.includes("-"))
-    await customElements.whenDefined(el.localName);
+    await whenDefinedOrTimeout(el.localName);
   if (el.updateComplete) await el.updateComplete;
   if (hard) {
     if (el.pageRendered) await el.pageRendered;
@@ -44,13 +75,19 @@ async function _selectTree(root, path, all = false) {
 }
 
 export async function selectTree(root, path, all = false, timeout = 10000) {
-  return Promise.race([
-    _selectTree(root, path, all),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(TIMEOUT_ERROR)), timeout)
-    ),
-  ]).catch((err) => {
+  // The timer is cleared once the race is decided; leaving it armed keeps the
+  // rejection closure (and the pending timeout promise behind it) alive for the
+  // full timeout even when the lookup finished immediately.
+  let timer: number | undefined;
+  const deadline = new Promise((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(TIMEOUT_ERROR)), timeout);
+  });
+  try {
+    return await Promise.race([_selectTree(root, path, all), deadline]);
+  } catch (err) {
     if (!err.message || err.message !== TIMEOUT_ERROR) throw err;
     return null;
-  });
+  } finally {
+    window.clearTimeout(timer);
+  }
 }
